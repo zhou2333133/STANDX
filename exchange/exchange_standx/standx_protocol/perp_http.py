@@ -58,13 +58,31 @@ class StandXPerpHTTP:
             ValueError: If request fails
         """
         url = f"{self.geo_url}/v1/region"
-        response = requests.get(url)
+        # 增加超时时间，防止网络问题导致长时间阻塞
+        response = requests.get(url, timeout=1.0)
         
         if not response.ok:
             raise ValueError(f"HTTP {response.status_code}: {response.text}")
         
         data = response.json()
-        return RegionResponse(data)
+        region = RegionResponse(data)
+        return region
+
+    def _get_sign_timestamp(self) -> int:
+        """
+        获取用于签名的时间戳（秒）
+        
+        优先使用服务器时间；如果无法获取服务器时间，则回退到本地时间。
+        """
+        try:
+            region = self.get_region()
+            if region.system_time is not None:
+                return int(region.system_time)
+        except Exception:
+            pass
+        
+        # 回退：使用本地时间（秒）
+        return int(time.time())
     
     def query_balance(
         self,
@@ -178,10 +196,9 @@ class StandXPerpHTTP:
         if not auth:
             raise ValueError("StandXAuth instance is required for request signing")
         
-        # 使用服务器时间进行签名，避免本地时间与服务器偏差导致签名过期
-        region_info = self.get_region()
+        # 使用缓存的服务器时间或本地时间进行签名，避免频繁访问 geo 接口导致阻塞
         request_id = str(uuid.uuid4())
-        timestamp = int(region_info.system_time)
+        timestamp = self._get_sign_timestamp()
         sign_headers = auth.sign_request(payload_str, request_id, timestamp)
         headers.update(sign_headers)
         
@@ -356,10 +373,9 @@ class StandXPerpHTTP:
         if not auth:
             raise ValueError("StandXAuth instance is required for request signing")
         
-        # 使用服务器时间进行签名，避免本地时间与服务器偏差导致签名过期
-        region_info = self.get_region()
+        # 使用缓存的服务器时间或本地时间进行签名，避免频繁访问 geo 接口导致阻塞
         request_id = str(uuid.uuid4())
-        timestamp = int(region_info.system_time)
+        timestamp = self._get_sign_timestamp()
         sign_headers = auth.sign_request(payload_str, request_id, timestamp)
         headers.update(sign_headers)
         

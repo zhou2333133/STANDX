@@ -1,0 +1,70 @@
+# 循环间隔配置（秒）
+loop_interval: 2  # 每次循环的间隔时间
+
+# 网格交易配置
+grid:
+  # 网格参数
+  grid_count: 8  # 网格数量（多单5个 + 空单5个）
+  price_interval: 30  # 价格间隔
+  min_price_distance: 20  # 最小价格距离，过滤掉距离当前价格太近的订单
+  
+  # 开仓参数
+  order_size_btc: 0.001  # 每个订单的开仓大小（BTC）
+  max_position_multiplier: 20  # 最大持仓倍数
+
+# 风险控制配置
+risk:
+  # 时间规则配置
+  # 键：0=周一, 1=周二, ..., 6=周日
+  # 值：时间段列表，格式为 ["HH:MM-HH:MM", ...]
+  time_rules:
+    0:  # 周一
+      - "13:00-21:00"
+    1:  # 周二
+      - "13:00-21:00"
+    2:  # 周三
+      - "13:00-21:00"
+    3:  # 周四
+      - "13:00-21:00"
+    4:  # 周五
+      - "13:00-21:00"
+    5:  # 周六
+      - "08:00-23:59"
+    6:  # 周日
+      - "00:00-08:00"
+      - "11:00-15:00"
+  
+  # 是否启用时间控制
+  enable_time_control: true
+  
+  # RSI和ADX风控配置
+  indicator_control:
+    # 是否启用指标风控
+    enable: true
+    # K线时间周期（5m, 15m, 30m, 1h, 4h, 1d等）
+    timeframe: "1h"
+    # RSI计算周期
+    rsi_period: 14
+    # ADX计算周期
+    adx_period: 14
+    # RSI允许范围 [min, max]
+    rsi_range: [30, 70]
+    # ADX最大阈值（ADX必须小于此值）
+    adx_max: 30
+    # ADX恢复阈值（当ADX触发风控后，需要降到这个值以下才能继续交易）
+    adx_recovery_threshold: 28
+  
+  # 限价单关闭持仓配置（时间风控触发时使用）
+  limit_order_close:
+    # 价格偏移量（多单用当前价格+offset，空单用当前价格-offset）
+    price_offset: 10
+    # 等待订单成交的时间（秒）
+    wait_time: 30
+    # 最大重试次数
+    max_retries: 10
+
+# API认证配置（可选，优先使用环境变量）
+auth:
+  trading_account_id: ""
+  api_key: ""
+  private_key: ""

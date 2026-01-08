@@ -16,8 +16,8 @@ sys.path.insert(0, project_root)
 from adapters.base_adapter import BasePerpAdapter, Balance, Position, Order
 
 # 导入 GRVT 相关模块
-# 注意：目录名包含 '-' 字符，需要添加到 sys.path 后直接导入模块名
-grvt_sdk_path = os.path.join(project_root, 'exchange', 'exchange_grvt', 'grvt-pysdk-main', 'src')
+# 注意：将 src 目录添加到 sys.path 后直接导入模块名
+grvt_sdk_path = os.path.join(project_root, 'exchange', 'exchange_grvt', 'src')
 if grvt_sdk_path not in sys.path:
     sys.path.insert(0, grvt_sdk_path)
 

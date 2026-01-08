@@ -1,0 +1,17 @@
+# GRVT Python SDK 依赖
+# 核心依赖
+aiohttp>=3.10.11
+backports-weakref>=1.0.post1
+dacite>=1.8.1
+dataclasses-json>=0.6.7
+eth-account>=0.13.4
+inflection>=0.5.1
+requests>=2.32.3
+websockets==13.1
+
+# 测试脚本依赖
+PyYAML>=6.0
+tzdata>=2024.1  # Windows 上使用 zoneinfo 需要此包
+playwright>=1.40.0  # 浏览器自动化
+
+

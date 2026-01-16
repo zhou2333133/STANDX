@@ -6,6 +6,8 @@ This module implements BasePerpAdapter for StandX exchange.
 import sys
 import os
 import time
+import base64
+import base58
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 
@@ -36,33 +38,120 @@ class StandXAdapter(BasePerpAdapter):
         初始化 StandX 适配器
         
         Args:
-            config: 配置字典，必须包含：
-                - exchange_name: "standx"
-                - private_key: 钱包私钥
-                - chain: 链名称，如 "bsc" 或 "solana"
+            config: 配置字典，支持两种认证方式：
+                方式1（优先）: API Token 方式
+                    - api_key: StandX API Token
+                    - signing_key: Ed25519 签名私钥（base64/hex/base58 格式）
+                方式2: 钱包私钥方式
+                    - private_key: 钱包私钥
+                    - chain: 链名称，如 "bsc" 或 "solana"
                 - base_url: API 基础 URL（可选，默认 https://perps.standx.com）
         """
         super().__init__(config)
-        self.private_key = config.get("private_key")
-        if not self.private_key:
-            raise ValueError("配置中必须包含 private_key")
         
+        # 优先使用 API Token 方式
+        self.api_key = config.get("api_key", "").strip()
+        self.signing_key = config.get("signing_key", "").strip()
+        
+        # 如果没有 API Token，则使用钱包私钥方式
+        self.private_key = config.get("private_key", "").strip()
         self.chain = config.get("chain", "bsc")
-        base_url = config.get("base_url", "https://perps.standx.com")
         
-        # 初始化客户端
-        self.auth = StandXAuth()
+        # 验证配置：支持两种登录方式，但只需要提供一种
+        has_api_token = bool(self.api_key)
+        has_wallet_key = bool(self.private_key)
+        
+        if not has_api_token and not has_wallet_key:
+            raise ValueError("配置中必须包含 api_key 或 private_key（至少一种）")
+        
+        # 如果使用 API Token 方式，必须提供 signing_key
+        if has_api_token and not self.signing_key:
+            raise ValueError("使用 API Token 方式时，必须提供 signing_key（与 api_key 配对）")
+        
+        # 如果只使用钱包私钥方式，不需要 signing_key（会自动生成 Ed25519 密钥对）
+        # chain 字段有默认值 "bsc"，所以即使不提供也可以工作
+        
+        base_url = config.get("base_url", "https://perps.standx.com")
         self.http_client = StandXPerpHTTP(base_url=base_url)
         
-        # 获取钱包地址
-        if self.private_key.startswith('0x'):
-            private_key = self.private_key[2:]
+        # 根据配置选择认证方式
+        if self.api_key:
+            # API Token 方式：使用提供的 signing_key 初始化 StandXAuth
+            signing_key_bytes = self._parse_signing_key(self.signing_key)
+            self.auth = StandXAuth(private_key=signing_key_bytes)
+            self.use_api_token = True
+            self.token = self.api_key  # API Token 直接作为 token 使用
         else:
-            private_key = self.private_key
+            # 钱包私钥方式：生成新的 Ed25519 密钥对用于请求签名
+            self.auth = StandXAuth()
+            self.use_api_token = False
+            
+            # 获取钱包地址
+            if self.private_key.startswith('0x'):
+                private_key = self.private_key[2:]
+            else:
+                private_key = self.private_key
+            
+            account = Web3().eth.account.from_key(private_key)
+            self.wallet_address = account.address
+            self.token: Optional[str] = None
+    
+    def _parse_signing_key(self, signing_key: str) -> bytes:
+        """
+        解析 signing_key，支持多种编码格式
         
-        account = Web3().eth.account.from_key(private_key)
-        self.wallet_address = account.address
-        self.token: Optional[str] = None
+        Args:
+            signing_key: Ed25519 私钥，支持 base64、hex、base58 格式
+            
+        Returns:
+            32 字节的私钥 bytes
+        """
+        if not signing_key:
+            raise ValueError("signing_key 不能为空")
+        
+        signing_key = signing_key.strip()
+        
+        # 尝试 base64 解码
+        try:
+            decoded = base64.b64decode(signing_key)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        
+        # 尝试 base64url 解码
+        try:
+            # base64url 使用 - 和 _ 而不是 + 和 /
+            base64url = signing_key.replace('-', '+').replace('_', '/')
+            # 添加 padding
+            padding = len(base64url) % 4
+            if padding:
+                base64url += '=' * (4 - padding)
+            decoded = base64.b64decode(base64url)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        
+        # 尝试 hex 解码
+        try:
+            if signing_key.startswith('0x'):
+                signing_key = signing_key[2:]
+            decoded = bytes.fromhex(signing_key)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        
+        # 尝试 base58 解码
+        try:
+            decoded = base58.b58decode(signing_key)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        
+        raise ValueError(f"无法解析 signing_key，支持的格式：base64、hex、base58。当前长度: {len(signing_key)}")
     
     def _sign_message(self, message: str) -> str:
         """签名消息"""
@@ -78,17 +167,23 @@ class StandXAdapter(BasePerpAdapter):
     def connect(self) -> bool:
         """连接到 StandX 并完成认证"""
         try:
-            def sign_message(msg: str) -> str:
-                return self._sign_message(msg)
-            
-            login_response = self.auth.authenticate(
-                chain=self.chain,
-                wallet_address=self.wallet_address,
-                sign_message=sign_message
-            )
-            
-            self.token = login_response.token
-            return True
+            if self.use_api_token:
+                # API Token 方式：直接使用 API Token，无需登录
+                # token 已经在 __init__ 中设置为 api_key
+                return True
+            else:
+                # 钱包私钥方式：需要先登录获取 token
+                def sign_message(msg: str) -> str:
+                    return self._sign_message(msg)
+                
+                login_response = self.auth.authenticate(
+                    chain=self.chain,
+                    wallet_address=self.wallet_address,
+                    sign_message=sign_message
+                )
+                
+                self.token = login_response.token
+                return True
         except Exception as e:
             raise Exception(f"StandX 认证失败: {e}")
     

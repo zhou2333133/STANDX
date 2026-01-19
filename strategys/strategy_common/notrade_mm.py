@@ -311,13 +311,24 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
         return
     
     # 根据价格映射获取订单ID
-    all_order_ids = []
+    all_order_ids_raw = []
     for price in cancel_long:
         if price in long_price_to_ids:
-            all_order_ids.extend(long_price_to_ids[price])
+            all_order_ids_raw.extend(long_price_to_ids[price])
     for price in cancel_short:
         if price in short_price_to_ids:
-            all_order_ids.extend(short_price_to_ids[price])
+            all_order_ids_raw.extend(short_price_to_ids[price])
+
+    if not all_order_ids_raw:
+        return
+
+    # 尝试转换为交易所要求的整型 ID
+    all_order_ids = []
+    for oid in all_order_ids_raw:
+        try:
+            all_order_ids.append(int(str(oid)))
+        except Exception:
+            print(f"撤单ID无法转换为整数，已跳过: {oid}")
     
     if not all_order_ids:
         return

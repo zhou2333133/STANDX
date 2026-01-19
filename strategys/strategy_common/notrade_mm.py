@@ -23,6 +23,16 @@ SYMBOL = None
 GRID_CONFIG = None
 RISK_CONFIG = None
 CANCEL_STALE_ORDERS_CONFIG = None
+STOP_CONFIG = {}
+VOL_GUARD_CONFIG = {}
+STATS = {
+    "placed": 0,
+    "canceled": 0,
+    "closed": 0,
+    "consecutive_closes": 0,
+}
+PRICE_WINDOW = []  # [(timestamp, price), ...]
+COOLING = False
 
 
 def load_config(config_file="config.yaml"):
@@ -106,7 +116,7 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
         config_file: 配置文件路径
         active_exchange_override: 通过命令行参数指定的交易所名称（必需）
     """
-    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG
+    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG, STOP_CONFIG, VOL_GUARD_CONFIG, STATS, PRICE_WINDOW, COOLING
     
     config = load_config(config_file)
     
@@ -135,6 +145,17 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
     GRID_CONFIG = config['grid']
     RISK_CONFIG = config.get('risk', {})
     CANCEL_STALE_ORDERS_CONFIG = config.get('cancel_stale_orders', {})
+    STOP_CONFIG = config.get('stop', {})
+    VOL_GUARD_CONFIG = config.get('volatility_guard', {})
+    # reset runtime state
+    STATS = {
+        "placed": 0,
+        "canceled": 0,
+        "closed": 0,
+        "consecutive_closes": 0,
+    }
+    PRICE_WINDOW = []
+    COOLING = False
 
 
 def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
@@ -327,6 +348,7 @@ def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
     if not place_long and not place_short:
         return
     
+    global STATS
     quantity_decimal = Decimal(str(quantity))
     
     # 做多订单：buy
@@ -342,6 +364,7 @@ def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
                 reduce_only=False
             )
             print(f"[下单成功][多单] 价格={price}, 数量={quantity_decimal}, 订单ID={getattr(order, 'order_id', None)}")
+            STATS["placed"] += 1
         except Exception as e:
             print(f"[下单失败][多单] 价格={price}, 数量={quantity_decimal}, 错误={e}")
     
@@ -358,6 +381,7 @@ def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
                 reduce_only=False
             )
             print(f"[下单成功][空单] 价格={price}, 数量={quantity_decimal}, 订单ID={getattr(order, 'order_id', None)}")
+            STATS["placed"] += 1
         except Exception as e:
             print(f"[下单失败][空单] 价格={price}, 数量={quantity_decimal}, 错误={e}")
 
@@ -413,30 +437,24 @@ def calculate_place_orders(target_long, target_short, current_long, current_shor
 
 
 def close_position_if_exists(adapter, symbol):
-    """检查持仓，如果有持仓则市价平仓
-    
-    注意: StandX 适配器的持仓查询接口可能未实现，此功能可能无法使用
-    
-    Args:
-        adapter: 适配器实例
-        symbol: 交易对符号
-    """
+    """检查持仓，如有则市价平仓；返回是否平仓"""
+    global STATS
+    closed = False
     try:
         positions = adapter.get_positions(symbol)
-        # get_positions 返回列表，取第一个持仓
         position = positions[0] if positions else None
         if position and position.size != Decimal("0"):
             print(f"检测到持仓: {position.size} {position.side}")
             print("取消所有未成交订单...")
             adapter.cancel_all_orders(symbol=symbol)
-            # 然后市价平仓
             print("市价平仓中...")
             adapter.close_position(symbol, order_type="market")
             print("平仓完成")
-        # 如果 position 为 None，说明 StandX 适配器的持仓查询接口可能未实现
-    except Exception as e:
-        # 如果持仓查询失败，静默处理（StandX 可能没有持仓查询接口）
+            STATS["closed"] += 1
+            closed = True
+    except Exception:
         pass
+    return closed
 
 
 def calculate_dynamic_price_spread(adx, current_price, default_spread, adx_threshold, adx_max=60):
@@ -473,6 +491,23 @@ def calculate_dynamic_price_spread(adx, current_price, default_spread, adx_thres
         return default_spread
 
 
+def update_price_window(last_price):
+    """维护最近窗口内价格，返回当前价格波幅（绝对值）"""
+    global PRICE_WINDOW
+    window_seconds = VOL_GUARD_CONFIG.get('window_seconds', 0) or 0
+    if window_seconds <= 0:
+        return None
+
+    now_ts = time.time()
+    PRICE_WINDOW.append((now_ts, last_price))
+    cutoff = now_ts - window_seconds
+    PRICE_WINDOW = [(t, p) for t, p in PRICE_WINDOW if t >= cutoff]
+    if not PRICE_WINDOW:
+        return None
+    prices = [p for _, p in PRICE_WINDOW]
+    return max(prices) - min(prices)
+
+
 def run_strategy_cycle(adapter):
     """执行一次策略循环
     
@@ -482,6 +517,10 @@ def run_strategy_cycle(adapter):
     price_info = adapter.get_ticker(SYMBOL)
     last_price = price_info.get('last_price') or price_info.get('mid_price') or price_info.get('mark_price')
     print(f"{SYMBOL} 价格: {last_price:.2f}")
+
+    # 维护价格窗口，计算波幅
+    price_range = update_price_window(last_price)
+    price_range_ratio = (price_range / last_price) if (price_range is not None and last_price) else None
 
     # 获取 ADX 指标并动态调整 price_spread
     default_spread = GRID_CONFIG['price_spread']
@@ -534,13 +573,76 @@ def run_strategy_cycle(adapter):
     )
     print(f"下单做多数组: {place_long}")
     print(f"下单做空数组: {place_short}")
-    
-    # 执行下单
-    place_orders_by_prices(
-        place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001)
-    )
-    # 检查持仓，如果有持仓则市价平仓
-    close_position_if_exists(adapter, SYMBOL)
+
+    # 波动保护&冷静期：冷静期内只撤单/平仓，不下新单
+    global COOLING
+    in_cooldown = False
+    if VOL_GUARD_CONFIG.get('enable', False) and price_range is not None:
+        enter_ratio = VOL_GUARD_CONFIG.get('enter_threshold_ratio')
+        exit_ratio = VOL_GUARD_CONFIG.get('exit_threshold_ratio')
+        enter_hit = enter_ratio is not None and price_range_ratio is not None and price_range_ratio > enter_ratio
+        exit_ok = exit_ratio is not None and price_range_ratio is not None and price_range_ratio <= exit_ratio
+
+        if (not COOLING) and enter_hit:
+            COOLING = True
+            try:
+                adapter.cancel_all_orders(symbol=SYMBOL)
+                print("进入冷静期，已撤销全部挂单")
+            except Exception as e:
+                print(f"进入冷静期撤单失败: {e}")
+            print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 超过触发阈值 {enter_ratio*100:.3f}%")
+            print("冷静期：只撤单/平仓，暂停下单")
+        if COOLING:
+            if exit_ok:
+                COOLING = False
+                print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 低于恢复阈值 {exit_ratio*100:.3f}%，冷静期结束，恢复下单")
+            else:
+                in_cooldown = True
+                print(f"冷静期中，波动 {price_range:.4f} ({price_range_ratio*100:.3f}%)，继续暂停下单，仅撤单/平仓")
+
+    # 执行下单（非冷静期）
+    if not in_cooldown:
+        place_orders_by_prices(
+            place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001)
+        )
+    else:
+        place_long, place_short = [], []
+
+    # 检查持仓，如果有持仓则市价平仓，并记录连续平仓
+    closed = close_position_if_exists(adapter, SYMBOL)
+    if closed:
+        STATS["consecutive_closes"] += 1
+    else:
+        STATS["consecutive_closes"] = 0
+
+    # 连续平仓保护
+    max_consecutive = STOP_CONFIG.get("max_consecutive_closes")
+    if max_consecutive and STATS["consecutive_closes"] >= max_consecutive:
+        print(f"连续平仓次数达到 {STATS['consecutive_closes']}/{max_consecutive}，停止策略")
+        try:
+            adapter.cancel_all_orders(symbol=SYMBOL)
+        except Exception as e:
+            print(f"停止策略时撤单失败: {e}")
+        return False
+
+    # 下单后余额保护：不足阈值则撤单并退出
+    min_balance = STOP_CONFIG.get("min_available_balance")
+    if min_balance is not None:
+        try:
+            balance = adapter.get_balance()
+            available = float(balance.available_balance)
+            if available < float(min_balance):
+                print(f"下单后可用余额 {available} < 阈值 {min_balance}，撤单并退出")
+                try:
+                    adapter.cancel_all_orders(symbol=SYMBOL)
+                except Exception as e:
+                    print(f"余额保护撤单失败: {e}")
+                close_position_if_exists(adapter, SYMBOL)
+                return False
+        except Exception as e:
+            print(f"查询余额失败，跳过余额保护: {e}")
+
+    return True
 
 
 def main():
@@ -583,7 +685,10 @@ def main():
         
         while True:
             try:
-                run_strategy_cycle(adapter)
+                cont = run_strategy_cycle(adapter)
+                if cont is False:
+                    print("策略因保护条件已停止")
+                    break
                 print(f"\n等待 {sleep_interval} 秒后继续...\n")
                 time.sleep(sleep_interval)
             except KeyboardInterrupt:

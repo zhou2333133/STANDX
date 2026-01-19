@@ -5,7 +5,7 @@ exchanges:
     signing_key: ""  
     private_key: ""  
     chain: bsc  
-    symbol: BTC-USD
+    symbol: ETH-USD
   
   grvt:
     exchange_name: grvt
@@ -16,15 +16,23 @@ exchanges:
     symbol: BTC-USDT
     
 grid:
-  upper_price: 200000
-  lower_price: 60000
-  price_step: 20
-  grid_count: 3
-  price_spread: 50
-  order_quantity: 0.002
-  sleep_interval: 1
+  upper_price: 4000
+  lower_price: 1000
+  price_step: 1
+  grid_count: 1
+  price_spread: 2.8            # 贴近 10bps（约3.2 美元），可调 2.5~3.5
+  order_quantity: 0.2
+  sleep_interval: 1.5
 
 risk:
+  enable: false              # 关闭 ADX
+
+stop:
+  max_consecutive_closes: 3
+  min_available_balance: 5   # USD
+
+volatility_guard:
   enable: true
-  adx_threshold: 16
-  adx_max: 60
+  window_seconds: 10
+  enter_threshold_ratio: 0.0013   # 0.13% 触发冷静期
+  exit_threshold_ratio: 0.0005    # 0.05% 恢复下单

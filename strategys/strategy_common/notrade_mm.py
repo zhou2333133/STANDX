@@ -33,6 +33,7 @@ STATS = {
 }
 PRICE_WINDOW = []  # [(timestamp, price), ...]
 COOLING = False
+COOLING_COUNT = 0
 
 
 def load_config(config_file="config.yaml"):
@@ -116,7 +117,7 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
         config_file: 配置文件路径
         active_exchange_override: 通过命令行参数指定的交易所名称（必需）
     """
-    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG, STOP_CONFIG, VOL_GUARD_CONFIG, STATS, PRICE_WINDOW, COOLING
+    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG, STOP_CONFIG, VOL_GUARD_CONFIG, STATS, PRICE_WINDOW, COOLING, COOLING_COUNT
     
     config = load_config(config_file)
     
@@ -156,6 +157,7 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
     }
     PRICE_WINDOW = []
     COOLING = False
+    COOLING_COUNT = 0
 
 
 def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
@@ -521,6 +523,11 @@ def run_strategy_cycle(adapter):
     # 维护价格窗口，计算波幅
     price_range = update_price_window(last_price)
     price_range_ratio = (price_range / last_price) if (price_range is not None and last_price) else None
+    if price_range is not None:
+        win_sec = VOL_GUARD_CONFIG.get('window_seconds', 0)
+        ratio_pct = price_range_ratio * 100 if price_range_ratio is not None else 0
+        print(f"波动: {ratio_pct:.3f}% (窗口 {win_sec}s)")
+        print(f"价格波幅: {price_range:.4f} (窗口 {win_sec}s)")
 
     # 获取 ADX 指标并动态调整 price_spread
     default_spread = GRID_CONFIG['price_spread']
@@ -575,7 +582,7 @@ def run_strategy_cycle(adapter):
     print(f"下单做空数组: {place_short}")
 
     # 波动保护&冷静期：冷静期内只撤单/平仓，不下新单
-    global COOLING
+    global COOLING, COOLING_COUNT
     in_cooldown = False
     if VOL_GUARD_CONFIG.get('enable', False) and price_range is not None:
         enter_ratio = VOL_GUARD_CONFIG.get('enter_threshold_ratio')
@@ -585,6 +592,7 @@ def run_strategy_cycle(adapter):
 
         if (not COOLING) and enter_hit:
             COOLING = True
+            COOLING_COUNT += 1
             try:
                 adapter.cancel_all_orders(symbol=SYMBOL)
                 print("进入冷静期，已撤销全部挂单")
@@ -641,6 +649,11 @@ def run_strategy_cycle(adapter):
                 return False
         except Exception as e:
             print(f"查询余额失败，跳过余额保护: {e}")
+
+    # 每轮汇总输出
+    print(f"=== 汇总 ===")
+    print(f"价格: {last_price:.2f} | 挂单 多{len(long_pending)} 空{len(short_pending)} | 冷静期次数 {COOLING_COUNT}")
+    print(f"累计: 下单 {STATS['placed']} 撤单 {STATS['canceled']} 平仓 {STATS['closed']} | 连续平仓 {STATS['consecutive_closes']}")
 
     return True
 

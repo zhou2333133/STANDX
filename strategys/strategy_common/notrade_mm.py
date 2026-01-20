@@ -621,7 +621,7 @@ def run_strategy_cycle(adapter):
     # 如果发现部分成交，立即冷静期
     if has_partial:
         handle_detected_fill(adapter, "检测到部分成交", STOP_CONFIG.get("cool_down_seconds", 30))
-        return False
+        return True
     
     # 计算需要撤单的数组
     cancel_long, cancel_short = calculate_cancel_orders(
@@ -685,7 +685,7 @@ def run_strategy_cycle(adapter):
     if post_exposure > 0 or post_exposure != pre_exposure:
         cool_sec = STOP_CONFIG.get("cool_down_seconds", 30)
         handle_detected_fill(adapter, "检测到成交/持仓变化", cool_sec)
-        return False
+        return True
 
     # 下单后余额保护：不足阈值则撤单并退出
     min_balance = STOP_CONFIG.get("min_available_balance")

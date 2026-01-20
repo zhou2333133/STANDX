@@ -30,10 +30,12 @@ STATS = {
     "canceled": 0,
     "closed": 0,
     "consecutive_closes": 0,
+    "fills_this_cycle": 0,
 }
 PRICE_WINDOW = []  # [(timestamp, price), ...]
 COOLING = False
 COOLING_COUNT = 0
+COOL_DOWN_UNTIL = 0
 
 
 def load_config(config_file="config.yaml"):
@@ -117,7 +119,7 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
         config_file: 配置文件路径
         active_exchange_override: 通过命令行参数指定的交易所名称（必需）
     """
-    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG, STOP_CONFIG, VOL_GUARD_CONFIG, STATS, PRICE_WINDOW, COOLING, COOLING_COUNT
+    global EXCHANGE_CONFIG, SYMBOL, GRID_CONFIG, RISK_CONFIG, CANCEL_STALE_ORDERS_CONFIG, STOP_CONFIG, VOL_GUARD_CONFIG, STATS, PRICE_WINDOW, COOLING, COOLING_COUNT, COOL_DOWN_UNTIL
     
     config = load_config(config_file)
     
@@ -158,6 +160,7 @@ def initialize_config(config_file="config.yaml", active_exchange_override=None):
     PRICE_WINDOW = []
     COOLING = False
     COOLING_COUNT = 0
+    COOL_DOWN_UNTIL = 0
 
 
 def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
@@ -308,7 +311,7 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
         adapter: 适配器实例
     """
     if not cancel_long and not cancel_short:
-        return
+        return True
     
     # 根据价格映射获取订单ID
     all_order_ids_raw = []
@@ -320,7 +323,7 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
             all_order_ids_raw.extend(short_price_to_ids[price])
 
     if not all_order_ids_raw:
-        return
+        return True
 
     # 尝试转换为交易所要求的整型 ID
     all_order_ids = []
@@ -331,7 +334,7 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
             print(f"撤单ID无法转换为整数，已跳过: {oid}")
     
     if not all_order_ids:
-        return
+        return True
     
     # 批量撤单
     try:
@@ -342,10 +345,15 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
             for order_id in all_order_ids:
                 try:
                     adapter.cancel_order(order_id=str(order_id))
-                except:
-                    pass
-    except:
-        pass
+                except Exception as e:
+                    print(f"单笔撤单失败 {order_id}: {e}")
+        # 【统计】累计撤单数量
+        STATS["canceled"] += len(all_order_ids)
+        print(f"已提交撤单 {len(all_order_ids)} 笔，价格: {cancel_long + cancel_short}")
+        return True
+    except Exception as e:
+        print(f"批量撤单调用失败: {e}")
+        return False
 
 
 def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
@@ -574,8 +582,8 @@ def run_strategy_cycle(adapter):
     print(f"撤单做多数组: {cancel_long}")
     print(f"撤单做空数组: {cancel_short}")
     
-    # 执行撤单
-    cancel_orders_by_prices(
+    # 执行撤单，若撤单失败则跳过新单
+    cancel_ok = cancel_orders_by_prices(
         cancel_long, cancel_short, long_price_to_ids, short_price_to_ids, adapter
     )
 
@@ -585,16 +593,24 @@ def run_strategy_cycle(adapter):
         cancel_probability = CANCEL_STALE_ORDERS_CONFIG.get('cancel_probability', 0.5)
         cancel_stale_order_ids(adapter, SYMBOL, stale_seconds, cancel_probability)
     
-    # 计算需要下单的数组
+    # 计算需要下单的数组（每侧最多保留 1 笔）
     place_long, place_short = calculate_place_orders(
         long_grid, short_grid, long_pending, short_pending
     )
+    if len(long_pending) >= 1:
+        place_long = []
+    if len(short_pending) >= 1:
+        place_short = []
     print(f"下单做多数组: {place_long}")
     print(f"下单做空数组: {place_short}")
 
     # 波动保护&冷静期：冷静期内只撤单/平仓，不下新单
-    global COOLING, COOLING_COUNT
+    global COOLING, COOLING_COUNT, COOL_DOWN_UNTIL
     in_cooldown = False
+    # 时间型冷静期判定（如因平仓触发）
+    now_ts = time.time()
+    if COOLING and COOL_DOWN_UNTIL and now_ts < COOL_DOWN_UNTIL:
+        in_cooldown = True
     if VOL_GUARD_CONFIG.get('enable', False) and price_range is not None:
         enter_ratio = VOL_GUARD_CONFIG.get('enter_threshold_ratio')
         exit_ratio = VOL_GUARD_CONFIG.get('exit_threshold_ratio')
@@ -612,7 +628,7 @@ def run_strategy_cycle(adapter):
             print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 超过触发阈值 {enter_ratio*100:.3f}%")
             print("冷静期：只撤单/平仓，暂停下单")
         if COOLING:
-            if exit_ok:
+            if exit_ok and (not COOL_DOWN_UNTIL or now_ts >= COOL_DOWN_UNTIL):
                 COOLING = False
                 print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 低于恢复阈值 {exit_ratio*100:.3f}%，冷静期结束，恢复下单")
             else:
@@ -620,7 +636,7 @@ def run_strategy_cycle(adapter):
                 print(f"冷静期中，波动 {price_range:.4f} ({price_range_ratio*100:.3f}%)，继续暂停下单，仅撤单/平仓")
 
     # 执行下单（非冷静期）
-    if not in_cooldown:
+    if not in_cooldown and cancel_ok:
         place_orders_by_prices(
             place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001)
         )
@@ -631,6 +647,11 @@ def run_strategy_cycle(adapter):
     closed = close_position_if_exists(adapter, SYMBOL)
     if closed:
         STATS["consecutive_closes"] += 1
+        cool_sec = STOP_CONFIG.get("close_cool_down_seconds", 5)
+        COOLING = True
+        COOLING_COUNT += 1
+        COOL_DOWN_UNTIL = time.time() + cool_sec
+        print(f"平仓后进入冷静期 {cool_sec} 秒，仅撤单/平仓，不下单")
     else:
         STATS["consecutive_closes"] = 0
 

@@ -209,15 +209,7 @@ def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
 
 
 def get_pending_orders_arrays(adapter, symbol):
-    """获取当前账号未成交订单数组，按做多和做空分类，同时返回价格到订单ID的映射
-    
-    Returns:
-        (long_prices, short_prices, long_price_to_ids, short_price_to_ids):
-        - long_prices: 做多价格数组
-        - short_prices: 做空价格数组
-        - long_price_to_ids: 做多价格到订单ID列表的字典映射
-        - short_price_to_ids: 做空价格到订单ID列表的字典映射
-    """
+    """获取当前账号未成交订单数组，按做多和做空分类，同时返回价格到订单ID的映射"""
     try:
         open_orders = adapter.get_open_orders(symbol=symbol)
         
@@ -227,6 +219,7 @@ def get_pending_orders_arrays(adapter, symbol):
         # 做空订单：side 为 "sell" 或 "short"
         short_prices = []
         short_price_to_ids = {}  # 价格 -> 订单ID列表
+        has_partial = False
         
         for order in open_orders:
             # 只处理未成交的订单（状态为 pending, open, partially_filled）
@@ -250,14 +243,16 @@ def get_pending_orders_arrays(adapter, symbol):
                         if price not in short_price_to_ids:
                             short_price_to_ids[price] = []
                         short_price_to_ids[price].append(order_id)
+                if order.status == "partially_filled":
+                    has_partial = True
         
-        return sorted(long_prices), sorted(short_prices), long_price_to_ids, short_price_to_ids
+        return sorted(long_prices), sorted(short_prices), long_price_to_ids, short_price_to_ids, has_partial
     except NotImplementedError:
         # 如果适配器未实现，返回空数组
-        return [], [], {}, {}
+        return [], [], {}, {}, False
     except Exception as e:
         print(f"获取未成交订单失败: {e}")
-        return [], [], {}, {}
+        return [], [], {}, {}, False
 
 
 def cancel_stale_order_ids(adapter, symbol, stale_seconds=5, cancel_probability=0.5):
@@ -357,7 +352,7 @@ def cancel_orders_by_prices(cancel_long, cancel_short, long_price_to_ids, short_
         return False
 
 
-def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
+def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity, best_bid=None, best_ask=None, tick=None):
     """根据价格列表下单
     
     Args:
@@ -375,6 +370,10 @@ def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
     
     # 做多订单：buy
     for price in place_long:
+        # 被动价校验：必须低于卖一 - 1tick
+        if best_ask is not None and tick is not None and price >= best_ask - tick:
+            print(f"[下单跳过][多单] 价格过近 {price} >= 卖一 {best_ask} - tick {tick}")
+            continue
         try:
             order = adapter.place_order(
                 symbol=symbol,
@@ -392,6 +391,10 @@ def place_orders_by_prices(place_long, place_short, adapter, symbol, quantity):
     
     # 做空订单：sell
     for price in place_short:
+        # 被动价校验：必须高于买一 + 1tick
+        if best_bid is not None and tick is not None and price <= best_bid + tick:
+            print(f"[下单跳过][空单] 价格过近 {price} <= 买一 {best_bid} + tick {tick}")
+            continue
         try:
             order = adapter.place_order(
                 symbol=symbol,
@@ -541,6 +544,28 @@ def trigger_cooldown(reason: str, seconds: float):
     print(f"进入冷静期 {seconds:.0f} 秒，原因: {reason}。仅撤单/平仓，暂停下单")
 
 
+def total_position_exposure(adapter, symbol):
+    """获取当前持仓总绝对数量，失败返回 0"""
+    try:
+        positions = adapter.get_positions(symbol)
+        return float(sum(abs(p.size) for p in positions)) if positions else 0.0
+    except Exception:
+        return 0.0
+
+
+def handle_detected_fill(adapter, reason: str, cool_sec: float):
+    """检测到成交迹象：全撤+平仓+冷静期"""
+    try:
+        adapter.cancel_all_orders(symbol=SYMBOL)
+    except Exception as e:
+        print(f"检测成交撤单失败: {e}")
+    try:
+        adapter.close_position(SYMBOL, order_type="market")
+    except Exception as e:
+        print(f"检测成交平仓失败: {e}")
+    trigger_cooldown(reason, cool_sec)
+
+
 def run_strategy_cycle(adapter):
     """执行一次策略循环
     
@@ -549,6 +574,9 @@ def run_strategy_cycle(adapter):
     """
     price_info = adapter.get_ticker(SYMBOL)
     last_price = price_info.get('last_price') or price_info.get('mid_price') or price_info.get('mark_price')
+    best_bid = price_info.get('bid_price')
+    best_ask = price_info.get('ask_price')
+    tick_size = GRID_CONFIG.get('price_step', 1)
     print(f"{SYMBOL} 价格: {last_price:.2f}")
 
     # 维护价格窗口，计算波幅
@@ -582,10 +610,18 @@ def run_strategy_cycle(adapter):
     print(f"做多数组: {long_grid}")
     print(f"做空数组: {short_grid}")
     
+    # 持仓/成交基线
+    pre_exposure = total_position_exposure(adapter, SYMBOL)
+
     # 获取未成交订单数组和价格到订单ID的映射
-    long_pending, short_pending, long_price_to_ids, short_price_to_ids = get_pending_orders_arrays(adapter, SYMBOL)
+    long_pending, short_pending, long_price_to_ids, short_price_to_ids, has_partial = get_pending_orders_arrays(adapter, SYMBOL)
     print(f"当前做多数组: {long_pending}")
     print(f"当前做空数组: {short_pending}")
+
+    # 如果发现部分成交，立即冷静期
+    if has_partial:
+        handle_detected_fill(adapter, "检测到部分成交", STOP_CONFIG.get("cool_down_seconds", 30))
+        return False
     
     # 计算需要撤单的数组
     cancel_long, cancel_short = calculate_cancel_orders(
@@ -635,19 +671,21 @@ def run_strategy_cycle(adapter):
                 print(f"冷静期延长：波动 {price_range_ratio*100 if price_range_ratio is not None else 'N/A'}% 超过恢复阈值，继续暂停下单")
 
     # 执行下单（非冷静期）
-    # 如果不在冷静期且撤单成功，尝试下单
+    # 如果不在冷静期且撤单成功，尝试下单（被动价校验）
     if not in_cooldown and cancel_ok:
         place_orders_by_prices(
-            place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001)
+            place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001),
+            best_bid=best_bid, best_ask=best_ask, tick=tick_size
         )
     else:
         place_long, place_short = [], []
 
-    # 检查持仓/成交：一旦发现持仓则平仓并触发冷静期
-    had_position = close_position_if_exists(adapter, SYMBOL)
-    if had_position:
+    # 下单后再次检测是否有成交/持仓变化
+    post_exposure = total_position_exposure(adapter, SYMBOL)
+    if post_exposure > 0 or post_exposure != pre_exposure:
         cool_sec = STOP_CONFIG.get("cool_down_seconds", 30)
-        trigger_cooldown("检测到成交/持仓，已平仓", cool_sec)
+        handle_detected_fill(adapter, "检测到成交/持仓变化", cool_sec)
+        return False
 
     # 下单后余额保护：不足阈值则撤单并退出
     min_balance = STOP_CONFIG.get("min_available_balance")

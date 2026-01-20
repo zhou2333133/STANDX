@@ -36,6 +36,7 @@ PRICE_WINDOW = []  # [(timestamp, price), ...]
 COOLING = False
 COOLING_COUNT = 0
 COOL_DOWN_UNTIL = 0
+COOL_DOWN_UNTIL = 0
 
 
 def load_config(config_file="config.yaml"):
@@ -458,13 +459,15 @@ def calculate_place_orders(target_long, target_short, current_long, current_shor
 
 
 def close_position_if_exists(adapter, symbol):
-    """检查持仓，如有则市价平仓；返回是否平仓"""
+    """检查持仓，如有则市价平仓；返回是否发现持仓并尝试平仓"""
     global STATS
     closed = False
+    had_position = False
     try:
         positions = adapter.get_positions(symbol)
         position = positions[0] if positions else None
         if position and position.size != Decimal("0"):
+            had_position = True
             print(f"检测到持仓: {position.size} {position.side}")
             print("取消所有未成交订单...")
             adapter.cancel_all_orders(symbol=symbol)
@@ -475,7 +478,7 @@ def close_position_if_exists(adapter, symbol):
             closed = True
     except Exception:
         pass
-    return closed
+    return closed or had_position
 
 
 def calculate_dynamic_price_spread(adx, current_price, default_spread, adx_threshold, adx_max=60):
@@ -527,6 +530,15 @@ def update_price_window(last_price):
         return None
     prices = [p for _, p in PRICE_WINDOW]
     return max(prices) - min(prices)
+
+
+def trigger_cooldown(reason: str, seconds: float):
+    """进入冷静期（时间型），仅撤单/平仓"""
+    global COOLING, COOLING_COUNT, COOL_DOWN_UNTIL
+    COOLING = True
+    COOLING_COUNT += 1
+    COOL_DOWN_UNTIL = time.time() + seconds
+    print(f\"进入冷静期 {seconds:.0f} 秒，原因: {reason}。仅撤单/平仓，暂停下单\")
 
 
 def run_strategy_cycle(adapter):
@@ -604,38 +616,26 @@ def run_strategy_cycle(adapter):
     print(f"下单做多数组: {place_long}")
     print(f"下单做空数组: {place_short}")
 
-    # 波动保护&冷静期：冷静期内只撤单/平仓，不下新单
+    # 冷静期：任何成交触发的时间冷静期结束后，再看波动是否低于恢复阈值
     global COOLING, COOLING_COUNT, COOL_DOWN_UNTIL
     in_cooldown = False
-    # 时间型冷静期判定（如因平仓触发）
     now_ts = time.time()
-    if COOLING and COOL_DOWN_UNTIL and now_ts < COOL_DOWN_UNTIL:
-        in_cooldown = True
-    if VOL_GUARD_CONFIG.get('enable', False) and price_range is not None:
-        enter_ratio = VOL_GUARD_CONFIG.get('enter_threshold_ratio')
-        exit_ratio = VOL_GUARD_CONFIG.get('exit_threshold_ratio')
-        enter_hit = enter_ratio is not None and price_range_ratio is not None and price_range_ratio > enter_ratio
-        exit_ok = exit_ratio is not None and price_range_ratio is not None and price_range_ratio <= exit_ratio
-
-        if (not COOLING) and enter_hit:
-            COOLING = True
-            COOLING_COUNT += 1
-            try:
-                adapter.cancel_all_orders(symbol=SYMBOL)
-                print("进入冷静期，已撤销全部挂单")
-            except Exception as e:
-                print(f"进入冷静期撤单失败: {e}")
-            print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 超过触发阈值 {enter_ratio*100:.3f}%")
-            print("冷静期：只撤单/平仓，暂停下单")
-        if COOLING:
-            if exit_ok and (not COOL_DOWN_UNTIL or now_ts >= COOL_DOWN_UNTIL):
+    exit_ratio = VOL_GUARD_CONFIG.get('exit_threshold_ratio')
+    if COOLING:
+        if COOL_DOWN_UNTIL and now_ts < COOL_DOWN_UNTIL:
+            in_cooldown = True
+            print(f"冷静期中（剩余 {COOL_DOWN_UNTIL - now_ts:.1f}s），仅撤单/平仓")
+        else:
+            # 冷静期时间已到，检查波动是否平稳
+            if price_range_ratio is not None and exit_ratio is not None and price_range_ratio <= exit_ratio:
                 COOLING = False
-                print(f"价格波动 {price_range:.4f} ({price_range_ratio*100:.3f}%) 低于恢复阈值 {exit_ratio*100:.3f}%，冷静期结束，恢复下单")
+                print(f"冷静期结束：波动 {price_range_ratio*100:.3f}% ≤ 恢复阈值 {exit_ratio*100:.3f}%，恢复下单")
             else:
                 in_cooldown = True
-                print(f"冷静期中，波动 {price_range:.4f} ({price_range_ratio*100:.3f}%)，继续暂停下单，仅撤单/平仓")
+                print(f"冷静期延长：波动 {price_range_ratio*100 if price_range_ratio is not None else 'N/A'}% 超过恢复阈值，继续暂停下单")
 
     # 执行下单（非冷静期）
+    # 如果不在冷静期且撤单成功，尝试下单
     if not in_cooldown and cancel_ok:
         place_orders_by_prices(
             place_long, place_short, adapter, SYMBOL, GRID_CONFIG.get('order_quantity', 0.001)
@@ -643,27 +643,11 @@ def run_strategy_cycle(adapter):
     else:
         place_long, place_short = [], []
 
-    # 检查持仓，如果有持仓则市价平仓，并记录连续平仓
-    closed = close_position_if_exists(adapter, SYMBOL)
-    if closed:
-        STATS["consecutive_closes"] += 1
-        cool_sec = STOP_CONFIG.get("close_cool_down_seconds", 5)
-        COOLING = True
-        COOLING_COUNT += 1
-        COOL_DOWN_UNTIL = time.time() + cool_sec
-        print(f"平仓后进入冷静期 {cool_sec} 秒，仅撤单/平仓，不下单")
-    else:
-        STATS["consecutive_closes"] = 0
-
-    # 连续平仓保护
-    max_consecutive = STOP_CONFIG.get("max_consecutive_closes")
-    if max_consecutive and STATS["consecutive_closes"] >= max_consecutive:
-        print(f"连续平仓次数达到 {STATS['consecutive_closes']}/{max_consecutive}，停止策略")
-        try:
-            adapter.cancel_all_orders(symbol=SYMBOL)
-        except Exception as e:
-            print(f"停止策略时撤单失败: {e}")
-        return False
+    # 检查持仓/成交：一旦发现持仓则平仓并触发冷静期
+    had_position = close_position_if_exists(adapter, SYMBOL)
+    if had_position:
+        cool_sec = STOP_CONFIG.get("cool_down_seconds", 30)
+        trigger_cooldown("检测到成交/持仓，已平仓", cool_sec)
 
     # 下单后余额保护：不足阈值则撤单并退出
     min_balance = STOP_CONFIG.get("min_available_balance")

@@ -538,7 +538,7 @@ def trigger_cooldown(reason: str, seconds: float):
     COOLING = True
     COOLING_COUNT += 1
     COOL_DOWN_UNTIL = time.time() + seconds
-    print(f\"进入冷静期 {seconds:.0f} 秒，原因: {reason}。仅撤单/平仓，暂停下单\")
+    print(f"进入冷静期 {seconds:.0f} 秒，原因: {reason}。仅撤单/平仓，暂停下单")
 
 
 def run_strategy_cycle(adapter):
